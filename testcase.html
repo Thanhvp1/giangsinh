@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magical 3D Christmas Tree V2</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/geometries/TeapotGeometry.js"></script> <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0b0c15; font-family: 'Segoe UI', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* Modern UI Glassmorphism */
+        #ui-layer {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: rgba(20, 20, 35, 0.7); 
+            padding: 20px; border-radius: 16px;
+            color: #eee; 
+            backdrop-filter: blur(10px); 
+            width: 300px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+            transition: opacity 0.3s;
+        }
+        
+        h1 { font-size: 1.4rem; margin: 0 0 15px 0; color: #ffd700; text-shadow: 0 0 10px rgba(255, 215, 0, 0.5); }
+        .control-group { margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+        label { font-size: 0.9rem; font-weight: 500; color: #ccc; }
+        
+        /* Custom Checkbox */
+        input[type="checkbox"] { accent-color: #ffd700; width: 18px; height: 18px; cursor: pointer; }
+        input[type="color"] { border: none; width: 40px; height: 25px; cursor: pointer; background: none; border-radius: 4px; }
+        
+        /* Camera Preview */
+        #camera-preview {
+            position: absolute; bottom: 20px; right: 20px; z-index: 10;
+            width: 200px; height: 150px; background: #000; border-radius: 12px;
+            overflow: hidden; border: 2px solid rgba(255,215,0,0.3);
+            display: none; 
+            box-shadow: 0 0 15px rgba(0,0,0,0.5);
+        }
+        #input_video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        
+        #loading-overlay {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; z-index: 20; font-size: 1.2rem;
+            text-align: center; pointer-events: none;
+            background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px;
+        }
+
+        .guide-text { font-size: 0.8rem; color: #888; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px; }
+        .key-point { color: #4deeea; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="loading-overlay">⏳ Đang khởi tạo AI & 3D Engine...</div>
+
+    <div id="ui-layer">
+        <h1>🎄 Magic Tree V2</h1>
+        <div class="control-group">
+            <label>Màu đèn chủ đạo:</label>
+            <input type="color" id="colorPicker" value="#ff0040">
+        </div>
+        <div class="control-group">
+            <label>✨ Đèn nhấp nháy:</label>
+            <input type="checkbox" id="twinkleToggle" checked>
+        </div>
+        <div class="control-group">
+            <label>❄️ Tuyết rơi:</label>
+            <input type="checkbox" id="snowToggle" checked>
+        </div>
+        <div class="control-group">
+            <label>📷 Hiện Camera:</label>
+            <input type="checkbox" id="camPreviewToggle">
+        </div>
+        
+        <div class="guide-text">
+            <p>1. <span class="key-point">Khoảng cách 2 tay:</span> Phóng to / Thu nhỏ.</p>
+            <p>2. <span class="key-point">Di chuyển sang bên:</span> Xoay cây.</p>
+            <p>3. <span class="key-point">Tối đa Scale:</span> Kích hoạt Super Star.</p>
+        </div>
+    </div>
+
+    <div id="camera-preview">
+        <video id="input_video"></video>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script>
+        // ==========================================
+        // 1. CONFIG & STATE
+        // ==========================================
+        const CONFIG = {
+            minDist: 0.05, maxDist: 0.40,
+            minScale: 0.5, maxScale: 2.0,
+            smoothFactor: 0.08, // Lower = smoother but slower
+            rotationSpeed: 3.0,
+            starPulseThresh: 0.90
+        };
+
+        const STATE = {
+            currentScale: 1.0, targetScale: 1.0,
+            currentRot: 0, targetRot: 0,
+            handDetected: false,
+            twinkle: true,
+            snow: true,
+            time: 0,
+            baseColor: new THREE.Color(0xff0040)
+        };
+
+        // ==========================================
+        // 2. THREE.JS SCENE SETUP
+        // ==========================================
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        // Nền gradient tối ảo diệu
+        scene.background = new THREE.Color(0x050510);
+        scene.fog = new THREE.FogExp2(0x050510, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 2, 5.5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.enableZoom = false; // Disable zoom to use gesture
+        controls.autoRotate = true;  // Auto rotate when idle
+        controls.autoRotateSpeed = 0.5;
+
+        // --- LIGHTING ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
+        scene.add(ambientLight);
+
+        const moonLight = new THREE.DirectionalLight(0xaaccff, 0.5);
+        moonLight.position.set(-5, 10, -5);
+        scene.add(moonLight);
+
+        const spotLight = new THREE.SpotLight(0xffd700, 1.5);
+        spotLight.position.set(5, 8, 5);
+        spotLight.angle = Math.PI / 4;
+        spotLight.penumbra = 0.5;
+        spotLight.castShadow = true;
+        spotLight.shadow.mapSize.width = 2048;
+        spotLight.shadow.mapSize.height = 2048;
+        scene.add(spotLight);
+
+        // ==========================================
+        // 3. OBJECTS CREATION
+        // ==========================================
+        const pivotGroup = new THREE.Group(); // Nhóm để xoay toàn bộ cây
+        scene.add(pivotGroup);
+
+        const ornaments = []; 
+        let starMesh, starPointLight, garlandMesh;
+
+        // --- Ground ---
+        const groundGeo = new THREE.CircleGeometry(4, 64);
+        const groundMat = new THREE.MeshStandardMaterial({ 
+            color: 0xeeeeff, roughness: 1, metalness: 0 
+        });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Background Stars ---
+        function createStarField() {
+            const starsGeo = new THREE.BufferGeometry();
+            const starsCount = 2000;
+            const posArray = new Float32Array(starsCount * 3);
+            for(let i=0; i<starsCount*3; i++) {
+                posArray[i] = (Math.random() - 0.5) * 30; // Spread wide
+            }
+            starsGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+            const starsMat = new THREE.PointsMaterial({color: 0xffffff, size: 0.03, transparent: true, opacity: 0.8});
+            const starField = new THREE.Points(starsGeo, starsMat);
+            scene.add(starField);
+        }
+        createStarField();
+
+        // --- Tree Generation ---
+        function createTree() {
+            // Materials
+            const leafMat = new THREE.MeshStandardMaterial({ 
+                color: 0x1a472a, roughness: 0.7, metalness: 0.1, flatShading: false 
+            });
+            const trunkMat = new THREE.MeshStandardMaterial({ color: 0x3d2817 });
+
+            // Trunk
+            const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.3, 1, 16), trunkMat);
+            trunk.position.y = 0.5;
+            trunk.castShadow = true;
+            pivotGroup.add(trunk);
+
+            // Layers
+            const layers = 5;
+            for(let i = 0; i < layers; i++) {
+                const t = i / (layers - 1); // 0 -> 1
+                const radius = THREE.MathUtils.lerp(1.2, 0.2, t);
+                const yPos = 1.0 + i * 0.6;
+                
+                const cone = new THREE.Mesh(new THREE.ConeGeometry(radius, 1.0, 32), leafMat);
+                cone.position.y = yPos;
+                cone.castShadow = true;
+                cone.receiveShadow = true;
+                pivotGroup.add(cone);
+
+                // Add Ornaments
+                addOrnaments(cone, radius, 1.0, 8 + i * 2);
+            }
+
+            // Top Star
+            const starGeo = new THREE.OctahedronGeometry(0.25, 0);
+            const starMat = new THREE.MeshStandardMaterial({ 
+                color: 0xffd700, emissive: 0xffaa00, emissiveIntensity: 0.5, metalness: 0.8, roughness: 0.2
+            });
+            starMesh = new THREE.Mesh(starGeo, starMat);
+            starMesh.position.y = 1.0 + (layers-1)*0.6 + 0.6;
+            pivotGroup.add(starMesh);
+
+            starPointLight = new THREE.PointLight(0xffaa00, 1, 5);
+            starPointLight.position.copy(starMesh.position);
+            pivotGroup.add(starPointLight);
+
+            // Create Garland (Dây kim tuyến)
+            createGarland(layers);
+        }
+
+        function createGarland(layers) {
+            // Tạo đường xoắn ốc
+            const points = [];
+            const totalHeight = layers * 0.6 + 0.5;
+            const loops = 4;
+            const pointsPerLoop = 20;
+            
+            for(let i=0; i <= loops * pointsPerLoop; i++) {
+                const p = i / (loops * pointsPerLoop); // 0 -> 1
+                const angle = p * Math.PI * 2 * loops;
+                const y = totalHeight * (1 - p) + 0.8;
+                // Bán kính giảm dần theo độ cao (hình nón)
+                const r = (1.2 * p) + 0.2; // Ước lượng, to ở dưới nhỏ ở trên
+                
+                const x = Math.cos(angle) * r;
+                const z = Math.sin(angle) * r;
+                points.push(new THREE.Vector3(x, y, z));
+            }
+
+            const path = new THREE.CatmullRomCurve3(points);
+            const tubeGeo = new THREE.TubeGeometry(path, 100, 0.04, 8, false);
+            const tubeMat = new THREE.MeshStandardMaterial({ 
+                color: 0xffffff, emissive: 0xaaaaaa, emissiveIntensity: 0.2,
+                roughness: 0.4, metalness: 0.8 
+            });
+            garlandMesh = new THREE.Mesh(tubeGeo, tubeMat);
+            pivotGroup.add(garlandMesh);
+        }
+
+        function addOrnaments(parent, radius, height, count) {
+            const orbGeo = new THREE.SphereGeometry(0.07, 16, 16);
+            
+            for(let i=0; i<count; i++) {
+                const orbMat = new THREE.MeshStandardMaterial({ 
+                    color: STATE.baseColor, emissive: STATE.baseColor, 
+                    emissiveIntensity: 0.5, roughness: 0.1 
+                });
+                
+                const angle = (i / count) * Math.PI * 2 + Math.random();
+                const r = radius - 0.15; // Thụt vào trong tán lá chút
+                const y = -height/2 + 0.15; 
+                
+                const x = Math.cos(angle) * r;
+                const z = Math.sin(angle) * r;
+
+                const orb = new THREE.Mesh(orbGeo, orbMat);
+                orb.position.set(x, y, z);
+                
+                // Lưu thêm thuộc tính phase để nhấp nháy lệch pha nhau
+                orb.userData = { 
+                    phase: Math.random() * Math.PI * 2,
+                    baseIntensity: 0.5
+                };
+                
+                ornaments.push({mesh: orb, mat: orbMat});
+                parent.add(orb);
+            }
+        }
+
+        createTree();
+
+        // --- Particles (Snow) ---
+        let snowSystem;
+        function createSnow() {
+            const count = 1000;
+            const pos = new Float32Array(count * 3);
+            const vels = new Float32Array(count); // Tốc độ rơi riêng
+
+            for(let i=0; i<count*3; i+=3) {
+                pos[i] = (Math.random() - 0.5) * 20;
+                pos[i+1] = Math.random() * 15;
+                pos[i+2] = (Math.random() - 0.5) * 20;
+                vels[i/3] = 0.02 + Math.random() * 0.04;
+            }
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geo.setAttribute('velocity', new THREE.BufferAttribute(vels, 1)); // Custom attribute
+
+            const mat = new THREE.PointsMaterial({
+                color: 0xffffff, size: 0.08, transparent: true, opacity: 0.8,
+                map: createSnowTexture(), // Procedural texture function below
+                depthWrite: false, blending: THREE.AdditiveBlending
+            });
+
+            snowSystem = new THREE.Points(geo, mat);
+            scene.add(snowSystem);
+        }
+
+        function createSnowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(16,16,0, 16,16,16);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0,0,32,32);
+            const tex = new THREE.Texture(canvas);
+            tex.needsUpdate = true;
+            return tex;
+        }
+        createSnow();
+
+        // ==========================================
+        // 4. MEDIAPIPE LOGIC
+        // ==========================================
+        const videoElement = document.getElementById('input_video');
+        const overlay = document.getElementById('loading-overlay');
+
+        function onResults(results) {
+            overlay.style.display = 'none'; // Hide loading when detected
+            STATE.handDetected = false;
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length >= 2) {
+                STATE.handDetected = true;
+                controls.autoRotate = false; // Stop auto rotate when interacting
+
+                // Get positions
+                const h1 = results.multiHandLandmarks[0][9];
+                const h2 = results.multiHandLandmarks[1][9];
+
+                // 1. Calculate Distance -> Scale
+                const dx = h1.x - h2.x;
+                const dy = h1.y - h2.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+
+                let t = (dist - CONFIG.minDist) / (CONFIG.maxDist - CONFIG.minDist);
+                t = THREE.MathUtils.clamp(t, 0, 1);
+                STATE.targetScale = THREE.MathUtils.lerp(CONFIG.minScale, CONFIG.maxScale, t);
+
+                // 2. Calculate Center Point X -> Rotation
+                // MediaPipe x is 0(left) to 1(right). 
+                // We want: Left(<0.4) -> Rot Left, Right(>0.6) -> Rot Right
+                const midX = (h1.x + h2.x) / 2;
+                
+                // Map midX to rotation target
+                // If midX is 0.5 (center), targetRot stays same (relative) 
+                // Actually easier: map midX to an angle
+                // 0 -> -PI, 1 -> +PI
+                const targetAngle = (0.5 - midX) * CONFIG.rotationSpeed; 
+                STATE.targetRot = targetAngle; // We will add this to current rotation
+
+            } else {
+                controls.autoRotate = true;
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        // Init Camera
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                videoElement.srcObject = stream;
+                videoElement.play();
+                processVideo();
+            } catch (err) {
+                overlay.innerText = "❌ Không tìm thấy Camera. Dùng chuột để xoay.";
+                console.error(err);
+            }
+        }
+        
+        async function processVideo() {
+            if (videoElement.readyState === 4) await hands.send({image: videoElement});
+            requestAnimationFrame(processVideo);
+        }
+        startCamera();
+
+        // ==========================================
+        // 5. ANIMATION LOOP
+        // ==========================================
+        function animate() {
+            requestAnimationFrame(animate);
+            STATE.time += 0.02;
+
+            // --- 1. Smooth Scaling & Physics ---
+            // Elastic interpolation for scale
+            STATE.currentScale += (STATE.targetScale - STATE.currentScale) * CONFIG.smoothFactor;
+            pivotGroup.scale.setScalar(STATE.currentScale);
+
+            // --- 2. Rotation Logic ---
+            if(STATE.handDetected) {
+                // Smoothly rotate towards hand direction
+                // pivotGroup.rotation.y += (STATE.targetRot - 0) * 0.05; // Relative spin
+                // Or Absolute mapping:
+                const targetY = STATE.targetRot * 2; // Amplify
+                pivotGroup.rotation.y += (targetY - pivotGroup.rotation.y) * 0.05;
+            } else {
+                // Handled by OrbitControls autoRotate or static
+                pivotGroup.rotation.y += 0.002;
+            }
+
+            // --- 3. Snow Animation ---
+            if(STATE.snow && snowSystem) {
+                const positions = snowSystem.geometry.attributes.position.array;
+                const vels = snowSystem.geometry.attributes.velocity.array;
+                for(let i=0; i<positions.length; i+=3) {
+                    positions[i+1] -= vels[i/3]; // y -= v
+                    // Wind effect
+                    positions[i] += Math.sin(STATE.time + positions[i+1]) * 0.01; 
+
+                    if(positions[i+1] < 0) {
+                        positions[i+1] = 15;
+                        positions[i] = (Math.random() - 0.5) * 20;
+                        positions[i+2] = (Math.random() - 0.5) * 20;
+                    }
+                }
+                snowSystem.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // --- 4. Ornaments Twinkle ---
+            if(ornaments.length > 0) {
+                ornaments.forEach(item => {
+                    if(STATE.twinkle) {
+                        // Sine wave based on time + random phase
+                        const sine = Math.sin(STATE.time * 3 + item.mesh.userData.phase);
+                        // Map -1..1 to 0.2..1.0
+                        const intensity = THREE.MathUtils.mapLinear(sine, -1, 1, 0.2, 1.5);
+                        item.mat.emissiveIntensity = intensity;
+                    } else {
+                        item.mat.emissiveIntensity = 0.5;
+                    }
+                });
+            }
+
+            // --- 5. Star Super Effect ---
+            const t = (STATE.currentScale - CONFIG.minScale) / (CONFIG.maxScale - CONFIG.minScale);
+            if(t > CONFIG.starPulseThresh) {
+                const surge = (t - CONFIG.starPulseThresh) / (1 - CONFIG.starPulseThresh);
+                starMesh.material.emissiveIntensity = 0.5 + surge * 3.0; // Super bright
+                starPointLight.intensity = 1 + surge * 5.0;
+                starMesh.rotation.y += 0.05; // Spin fast
+                starMesh.scale.setScalar(1 + Math.sin(STATE.time * 20) * 0.2 * surge);
+            } else {
+                starMesh.rotation.y += 0.01;
+                starMesh.scale.setScalar(1);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // ==========================================
+        // 6. UI HANDLERS
+        // ==========================================
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        document.getElementById('colorPicker').addEventListener('input', (e) => {
+            STATE.baseColor.set(e.target.value);
+            ornaments.forEach(o => {
+                o.mat.color.set(STATE.baseColor);
+                o.mat.emissive.set(STATE.baseColor);
+            });
+        });
+
+        document.getElementById('twinkleToggle').addEventListener('change', (e) => STATE.twinkle = e.target.checked);
+        document.getElementById('snowToggle').addEventListener('change', (e) => {
+            STATE.snow = e.target.checked;
+            snowSystem.visible = e.target.checked;
+        });
+        document.getElementById('camPreviewToggle').addEventListener('change', (e) => {
+            document.getElementById('camera-preview').style.display = e.target.checked ? 'block' : 'none';
+        });
+
+        // Mouse Wheel Fallback
+        window.addEventListener('wheel', (e) => {
+            if(!STATE.handDetected) {
+                const delta = -Math.sign(e.deltaY) * 0.1;
+                STATE.targetScale = THREE.MathUtils.clamp(STATE.targetScale + delta, CONFIG.minScale, CONFIG.maxScale);
+            }
+        });
+    </script>
+</body>
+</html>
